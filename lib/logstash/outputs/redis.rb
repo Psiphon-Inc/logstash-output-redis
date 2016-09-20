@@ -49,6 +49,14 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
   # Password to authenticate with.  There is no authentication by default.
   config :password, :validate => :password
 
+  # Number of log events to process before reconnecting to redis, 0 is never
+  config :reconnect_after, :validate => :number, :default => 0
+  @@events_processed = 0
+
+  # Allow this instance of the output to force reconnecting to redis on receiving a SIGWINCH
+  config :handle_sigwinch, :validate => :boolean, :default => false
+  @@sigwinch_id = nil
+
   # The name of the Redis queue (we'll use RPUSH on this). Dynamic names are
   # valid here, for example `logstash-%{type}`
   config :queue, :validate => :string, :deprecated => true
@@ -217,6 +225,8 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
       params[:password] = @password.value
     end
 
+    @@sigwinch_id = trap_sigwinch if @handle_sigwinch
+
     Redis.new(params)
   end # def connect
 
@@ -243,6 +253,15 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
       else
         @redis.publish(key, payload)
       end
+
+      if @reconnect_after > 0
+        @@events_processed += 1
+        if @@events_processed >= @reconnect_after
+          @logger.debug("Event reconnect threshold reached, reconnecting to redis, resetting counter")
+          force_reconnect
+          @@events_processed = 0
+        end
+      end
     rescue => e
       @logger.warn("Failed to send event to Redis", :event => event,
                    :identity => identity, :exception => e,
@@ -250,6 +269,21 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
       sleep @reconnect_interval
       @redis = nil
       retry
+    end
+  end
+
+  def force_reconnect
+    return if @redis.nil? || !@redis.connected?
+
+    @redis.client.disconnect
+    # Reset the redis variable to trigger reconnect
+    @redis = nil
+  end
+
+  def trap_sigwinch
+    Stud::trap("WINCH") do
+      @logger.debug("SIGWINCH caught, forcing reconnect")
+      force_reconnect
     end
   end
 end
